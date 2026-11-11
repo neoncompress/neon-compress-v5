@@ -1,337 +1,616 @@
-// ============================================
-// NEON COMPRESS V5
-// Independent MP4 Fast Start Engine
-// No FFmpeg / No CompressBase / No Re-encoding
-// ============================================
+// =====================================================
+// NEON COMPRESS V5.2
+// INDEPENDENT VIDEO PROCESSING ENGINE
+//
+// QUALITY METHOD  : Original stream copy
+// FPS METHOD      : Preserve original frame timing
+// TIKTOK OPTIMIZER: H.264 MP4 re-encoding
+//
+// No CompressBase dependency
+// Single-thread FFmpeg WASM
+// =====================================================
 
 (function () {
 "use strict";
 
-const CONTAINERS = new Set([
-  "moov",
-  "trak",
-  "mdia",
-  "minf",
-  "stbl",
-  "edts",
-  "dinf",
-  "mvex"
-]);
+const NEON_CONFIG = {
+    version: "5.2",
+
+    ffmpeg: "0.12.10",
+
+    coreURL:
+      "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js",
+
+    wasmURL:
+      "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.wasm",
+
+    defaultMode: "tiktok",
+
+    crf: 18,
+
+    preset: "medium",
+
+    audioBitrate: "192k"
+};
+
+let ffmpegInstance = null;
+let ffmpegLoading = null;
+
+
+// =====================================================
+// BASIC UTILITIES
+// =====================================================
+
+function formatSize(bytes) {
+    return (bytes / 1048576).toFixed(2) + " MB";
+}
 
 function readType(view, offset) {
-  return String.fromCharCode(
-    view.getUint8(offset),
-    view.getUint8(offset + 1),
-    view.getUint8(offset + 2),
-    view.getUint8(offset + 3)
-  );
+    return String.fromCharCode(
+        view.getUint8(offset),
+        view.getUint8(offset + 1),
+        view.getUint8(offset + 2),
+        view.getUint8(offset + 3)
+    );
 }
 
-function readBoxes(data, start = 0, end = data.byteLength) {
-  const view = new DataView(
-    data.buffer,
-    data.byteOffset,
-    data.byteLength
-  );
+function readBoxes(data, start = 0, end = data.length) {
 
-  const boxes = [];
-  let offset = start;
+    const view = new DataView(
+        data.buffer,
+        data.byteOffset,
+        data.byteLength
+    );
 
-  while (offset + 8 <= end) {
-    let size = view.getUint32(offset);
-    const type = readType(view, offset + 4);
-    let headerSize = 8;
+    const boxes = [];
 
-    if (size === 1) {
-      if (offset + 16 > end) throw new Error("Invalid MP4 box");
+    let offset = start;
 
-      const high = view.getUint32(offset + 8);
-      const low = view.getUint32(offset + 12);
+    while (offset + 8 <= end) {
 
-      size = high * 4294967296 + low;
-      headerSize = 16;
-    } else if (size === 0) {
-      size = end - offset;
-    }
+        let size = view.getUint32(offset);
 
-    if (
-      !Number.isSafeInteger(size) ||
-      size < headerSize ||
-      offset + size > end
-    ) {
-      throw new Error("Invalid MP4 box size: " + type);
-    }
+        const type = readType(view, offset + 4);
 
-    boxes.push({
-      type,
-      start: offset,
-      end: offset + size,
-      size,
-      headerSize,
-      data: data.subarray(offset, offset + size)
-    });
+        let headerSize = 8;
 
-    offset += size;
-  }
+        if (size === 1) {
 
-  return boxes;
-}
+            if (offset + 16 > end) {
+                throw new Error("Invalid MP4 extended box");
+            }
 
-function joinArrays(arrays) {
-  const total = arrays.reduce((sum, a) => sum + a.length, 0);
-  const output = new Uint8Array(total);
+            const high = view.getUint32(offset + 8);
+            const low = view.getUint32(offset + 12);
 
-  let position = 0;
+            size = high * 4294967296 + low;
 
-  for (const array of arrays) {
-    output.set(array, position);
-    position += array.length;
-  }
+            headerSize = 16;
 
-  return output;
-}
+        } else if (size === 0) {
 
-function makeBox(type, payload) {
-  const size = payload.length + 8;
-
-  if (size <= 0xffffffff) {
-    const output = new Uint8Array(size);
-    const view = new DataView(output.buffer);
-
-    view.setUint32(0, size);
-
-    for (let i = 0; i < 4; i++) {
-      output[4 + i] = type.charCodeAt(i);
-    }
-
-    output.set(payload, 8);
-    return output;
-  }
-
-  const output = new Uint8Array(payload.length + 16);
-  const view = new DataView(output.buffer);
-
-  view.setUint32(0, 1);
-
-  for (let i = 0; i < 4; i++) {
-    output[4 + i] = type.charCodeAt(i);
-  }
-
-  view.setUint32(8, 0);
-  view.setUint32(12, output.length);
-  output.set(payload, 16);
-
-  return output;
-}
-
-function parseTree(data, start = 0, end = data.length) {
-  return readBoxes(data, start, end).map(box => {
-    if (!CONTAINERS.has(box.type)) {
-      return { ...box, children: null };
-    }
-
-    const childStart = box.start + box.headerSize;
-
-    return {
-      ...box,
-      children: parseTree(data, childStart, box.end)
-    };
-  });
-}
-
-function serializeTree(boxes, shift) {
-  return joinArrays(boxes.map(box => {
-    if (box.type === "stco" || box.type === "co64") {
-      return updateChunkOffsets(box, shift);
-    }
-
-    if (box.children) {
-      const children = serializeTree(box.children, shift);
-      const payload = joinArrays([
-        box.data.subarray(0, box.headerSize),
-        children
-      ]);
-
-      return makeBox(box.type, payload);
-    }
-
-    return box.data;
-  }));
-}
-
-function updateChunkOffsets(box, shift) {
-  const view = new DataView(
-    box.data.buffer,
-    box.data.byteOffset,
-    box.data.byteLength
-  );
-
-  const count = view.getUint32(box.headerSize + 4);
-  const entrySize = box.type === "co64" ? 8 : 4;
-  const entriesStart = box.headerSize + 8;
-
-  if (
-    entriesStart + count * entrySize > box.data.length
-  ) {
-    throw new Error("Invalid chunk offset table");
-  }
-
-  const payload = new Uint8Array(box.data.length - box.headerSize);
-  payload.set(box.data.subarray(box.headerSize));
-
-  const newView = new DataView(
-    payload.buffer,
-    payload.byteOffset,
-    payload.byteLength
-  );
-
-  for (let i = 0; i < count; i++) {
-    const position = 8 + i * entrySize;
-
-    if (entrySize === 4) {
-      const value = newView.getUint32(position);
-
-      if (value >= shift.insertionPoint) {
-        const updated = value + shift.amount;
-
-        if (updated > 0xffffffff) {
-          throw new Error(
-            "Chunk offset requires co64 upgrade. Processing stopped safely."
-          );
+            size = end - offset;
         }
 
-        newView.setUint32(position, updated);
-      }
-    } else {
-      const high = newView.getUint32(position);
-      const low = newView.getUint32(position + 4);
-
-      const value = high * 4294967296 + low;
-
-      if (value >= shift.insertionPoint) {
-        const updated = value + shift.amount;
-
-        if (!Number.isSafeInteger(updated)) {
-          throw new Error("Unsafe 64-bit chunk offset");
+        if (
+            !Number.isSafeInteger(size) ||
+            size < headerSize ||
+            offset + size > end
+        ) {
+            throw new Error("Invalid MP4 box: " + type);
         }
 
-        newView.setUint32(position, Math.floor(updated / 4294967296));
-        newView.setUint32(position + 4, updated % 4294967296);
-      }
+        boxes.push({
+            type,
+            start: offset,
+            end: offset + size,
+            size,
+            headerSize
+        });
+
+        offset += size;
     }
-  }
 
-  return makeBox(box.type, payload);
+    return boxes;
 }
 
-async function readFile(file) {
-  return new Uint8Array(await file.arrayBuffer());
-}
+
+// =====================================================
+// VIDEO INSPECTION
+// =====================================================
 
 async function inspectVideoV5(file) {
-  if (!(file instanceof Blob)) {
-    throw new Error("Please select a video file");
-  }
 
-  const data = await readFile(file);
-  const boxes = readBoxes(data);
-
-  const ftyp = boxes.find(b => b.type === "ftyp");
-  const moov = boxes.find(b => b.type === "moov");
-  const mdat = boxes.find(b => b.type === "mdat");
-
-  if (!ftyp || !moov || !mdat) {
-    throw new Error("Invalid or unsupported MP4 file");
-  }
-
-  return {
-    fileName: file.name || "video.mp4",
-    fileSize: file.size,
-    fileSizeMB: (file.size / 1048576).toFixed(2),
-    format: "MP4",
-    ftyp: true,
-    moov: true,
-    mdat: true,
-    fastStart: moov.start < mdat.start,
-    moovPosition: moov.start,
-    mdatPosition: mdat.start,
-    topLevelBoxes: boxes.map(b => b.type)
-  };
-}
-
-async function rebuildMP4FastStartV5(file) {
-  const data = await readFile(file);
-  const boxes = readBoxes(data);
-
-  const moov = boxes.find(b => b.type === "moov");
-  const ftyp = boxes.find(b => b.type === "ftyp");
-  const firstMdat = boxes.find(b => b.type === "mdat");
-
-  if (!moov || !ftyp || !firstMdat) {
-    throw new Error("Required MP4 boxes are missing");
-  }
-
-  if (moov.start < firstMdat.start) {
-    return {
-      file: new Blob([data], { type: "video/mp4" }),
-      changed: false
-    };
-  }
-
-  const tree = parseTree(data, moov.start, moov.end);
-
-  const newMoov = serializeTree(tree, {
-    insertionPoint: firstMdat.start,
-    amount: moov.size
-  });
-
-  const beforeMdat = data.subarray(0, firstMdat.start);
-  const afterMdat = data.subarray(firstMdat.start, moov.start);
-  const afterMoov = data.subarray(moov.end);
-
-  const output = joinArrays([
-    beforeMdat,
-    newMoov,
-    afterMdat,
-    afterMoov
-  ]);
-
-  return {
-    file: new Blob([output], { type: "video/mp4" }),
-    changed: true
-  };
-}
-
-async function optimizeVideoV5(file) {
-  const before = await inspectVideoV5(file);
-
-  const rebuilt = await rebuildMP4FastStartV5(file);
-
-  const after = await inspectVideoV5(rebuilt.file);
-
-  if (!after.fastStart) {
-    throw new Error("Fast Start verification failed");
-  }
-
-  return {
-    file: rebuilt.file,
-    method: "MP4 FAST START",
-    changes: {
-      fastStartApplied: rebuilt.changed,
-      originalSize: before.fileSize,
-      outputSize: rebuilt.file.size,
-      resolution: "Original video samples preserved",
-      videoReencoding: false,
-      fpsInterpolation: false,
-      audioReencoding: false
+    if (!(file instanceof Blob)) {
+        throw new Error("Please select a video file.");
     }
-  };
+
+    if (!file.size) {
+        throw new Error("Video file is empty.");
+    }
+
+    const header = new Uint8Array(
+        await file.slice(0, Math.min(file.size, 1024 * 1024))
+            .arrayBuffer()
+    );
+
+    const boxes = readBoxes(header);
+
+    const ftyp = boxes.find(box => box.type === "ftyp");
+
+    if (!ftyp) {
+        throw new Error("MP4 format not recognized.");
+    }
+
+    const moov = boxes.find(box => box.type === "moov");
+    const mdat = boxes.find(box => box.type === "mdat");
+
+    // If moov is beyond the first 1 MB, scan the complete file.
+    let fullBoxes = boxes;
+
+    if (!moov || !mdat) {
+
+        const completeData = new Uint8Array(
+            await file.arrayBuffer()
+        );
+
+        fullBoxes = readBoxes(completeData);
+
+    }
+
+    const finalMoov = fullBoxes.find(
+        box => box.type === "moov"
+    );
+
+    const finalMdat = fullBoxes.find(
+        box => box.type === "mdat"
+    );
+
+    if (!finalMoov || !finalMdat) {
+        throw new Error("Required MP4 boxes are missing.");
+    }
+
+    return {
+        fileName: file.name || "video.mp4",
+
+        fileSize: file.size,
+
+        fileSizeMB: formatSize(file.size),
+
+        format: "MP4",
+
+        ftyp: true,
+
+        moov: true,
+
+        mdat: true,
+
+        fastStart: finalMoov.start < finalMdat.start,
+
+        moovPosition: finalMoov.start,
+
+        mdatPosition: finalMdat.start,
+
+        topLevelBoxes: fullBoxes.map(box => box.type)
+    };
 }
+
+
+// =====================================================
+// LOAD FFMPEG
+// =====================================================
+
+async function loadFFmpeg() {
+
+    if (ffmpegInstance && ffmpegInstance.loaded) {
+        return ffmpegInstance;
+    }
+
+    if (ffmpegLoading) {
+        return ffmpegLoading;
+    }
+
+    ffmpegLoading = (async () => {
+
+        if (!window.crossOriginIsolated) {
+            console.warn(
+                "Cross-origin isolation is disabled. " +
+                "Using single-thread FFmpeg."
+            );
+        }
+
+        const { FFmpeg } = await import(
+            "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js"
+        );
+
+        const { toBlobURL } = await import(
+            "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js"
+        );
+
+        const ffmpeg = new FFmpeg();
+
+        ffmpeg.on("log", ({ message }) => {
+            console.log("[NEON FFmpeg]", message);
+        });
+
+        ffmpeg.on("progress", ({ progress }) => {
+
+            const percent = Math.max(
+                0,
+                Math.min(100, Math.round(progress * 100))
+            );
+
+            if (typeof window.NEON_V5_PROGRESS === "function") {
+                window.NEON_V5_PROGRESS(percent);
+            }
+
+        });
+
+        const coreURL = await toBlobURL(
+            NEON_CONFIG.coreURL,
+            "text/javascript"
+        );
+
+        const wasmURL = await toBlobURL(
+            NEON_CONFIG.wasmURL,
+            "application/wasm"
+        );
+
+        await ffmpeg.load({
+            coreURL,
+            wasmURL
+        });
+
+        ffmpegInstance = ffmpeg;
+
+        return ffmpeg;
+
+    })();
+
+    try {
+
+        return await ffmpegLoading;
+
+    } catch (error) {
+
+        ffmpegLoading = null;
+
+        throw new Error(
+            "FFmpeg loading failed: " + error.message
+        );
+
+    }
+}
+
+
+// =====================================================
+// FILE CLEANUP
+// =====================================================
+
+async function cleanupFFmpeg(ffmpeg, files) {
+
+    for (const name of files) {
+
+        try {
+            await ffmpeg.deleteFile(name);
+        } catch (error) {
+            console.warn("Cleanup skipped:", name);
+        }
+
+    }
+}
+
+
+// =====================================================
+// QUALITY METHOD
+// Original Video Stream Copy
+// =====================================================
+
+async function qualityMethod(file) {
+
+    const ffmpeg = await loadFFmpeg();
+
+    const inputName = "neon_input.mp4";
+    const outputName = "neon_quality.mp4";
+
+    try {
+
+        await ffmpeg.writeFile(
+            inputName,
+            new Uint8Array(await file.arrayBuffer())
+        );
+
+        await ffmpeg.exec([
+
+            "-i", inputName,
+
+            "-map", "0:v:0",
+
+            "-map", "0:a?",
+
+            "-c", "copy",
+
+            "-map_metadata", "0",
+
+            "-movflags", "+faststart",
+
+            "-f", "mp4",
+
+            outputName
+
+        ]);
+
+        const result = await ffmpeg.readFile(outputName);
+
+        return new Blob(
+            [result.buffer.slice(
+                result.byteOffset,
+                result.byteOffset + result.byteLength
+            )],
+            { type: "video/mp4" }
+        );
+
+    } finally {
+
+        await cleanupFFmpeg(
+            ffmpeg,
+            [inputName, outputName]
+        );
+
+    }
+}
+
+
+// =====================================================
+// FPS METHOD
+// Preserve Original Frame Timing
+// =====================================================
+
+async function fpsMethod(file) {
+
+    const ffmpeg = await loadFFmpeg();
+
+    const inputName = "neon_fps_input.mp4";
+    const outputName = "neon_fps_output.mp4";
+
+    try {
+
+        await ffmpeg.writeFile(
+            inputName,
+            new Uint8Array(await file.arrayBuffer())
+        );
+
+        await ffmpeg.exec([
+
+            "-i", inputName,
+
+            "-map", "0:v:0",
+
+            "-map", "0:a?",
+
+            "-c", "copy",
+
+            "-fps_mode", "passthrough",
+
+            "-map_metadata", "0",
+
+            "-movflags", "+faststart",
+
+            "-f", "mp4",
+
+            outputName
+
+        ]);
+
+        const result = await ffmpeg.readFile(outputName);
+
+        return new Blob(
+            [result.buffer.slice(
+                result.byteOffset,
+                result.byteOffset + result.byteLength
+            )],
+            { type: "video/mp4" }
+        );
+
+    } finally {
+
+        await cleanupFFmpeg(
+            ffmpeg,
+            [inputName, outputName]
+        );
+
+    }
+}
+
+
+// =====================================================
+// TIKTOK OPTIMIZER
+// H.264 MP4 RE-ENCODING
+// =====================================================
+
+async function tiktokOptimizer(file) {
+
+    const ffmpeg = await loadFFmpeg();
+
+    const inputName = "neon_tiktok_input.mp4";
+    const outputName = "neon_tiktok_output.mp4";
+
+    try {
+
+        await ffmpeg.writeFile(
+            inputName,
+            new Uint8Array(await file.arrayBuffer())
+        );
+
+        await ffmpeg.exec([
+
+            "-i", inputName,
+
+            "-map", "0:v:0",
+
+            "-map", "0:a?",
+
+            // H.264 Video
+            "-c:v", "libx264",
+
+            // High visual quality
+            "-preset", NEON_CONFIG.preset,
+
+            "-crf", String(NEON_CONFIG.crf),
+
+            // Compatible pixel format
+            "-pix_fmt", "yuv420p",
+
+            "-profile:v", "high",
+
+            // Keep original frame timing
+            "-fps_mode", "passthrough",
+
+            // AAC Audio
+            "-c:a", "aac",
+
+            "-b:a", NEON_CONFIG.audioBitrate,
+
+            "-ar", "48000",
+
+            // Preserve metadata
+            "-map_metadata", "0",
+
+            // MP4 Fast Start
+            "-movflags", "+faststart",
+
+            "-f", "mp4",
+
+            outputName
+
+        ]);
+
+        const result = await ffmpeg.readFile(outputName);
+
+        return new Blob(
+            [result.buffer.slice(
+                result.byteOffset,
+                result.byteOffset + result.byteLength
+            )],
+            { type: "video/mp4" }
+        );
+
+    } finally {
+
+        await cleanupFFmpeg(
+            ffmpeg,
+            [inputName, outputName]
+        );
+
+    }
+}
+
+
+// =====================================================
+// MAIN PROCESSING API
+// =====================================================
+
+async function optimizeVideoV5(file, options = {}) {
+
+    if (!(file instanceof Blob)) {
+        throw new Error("Please select a valid MP4 video.");
+    }
+
+    const mode = (
+        options.mode || NEON_CONFIG.defaultMode
+    ).toLowerCase();
+
+    const before = await inspectVideoV5(file);
+
+    let output;
+
+    if (mode === "quality") {
+
+        output = await qualityMethod(file);
+
+    } else if (mode === "fps") {
+
+        output = await fpsMethod(file);
+
+    } else if (mode === "tiktok") {
+
+        output = await tiktokOptimizer(file);
+
+    } else {
+
+        throw new Error("Unknown processing mode: " + mode);
+
+    }
+
+    if (!output || !output.size) {
+        throw new Error("Processing produced an empty video.");
+    }
+
+    const after = await inspectVideoV5(output);
+
+    return {
+
+        file: output,
+
+        method: mode.toUpperCase(),
+
+        changes: {
+
+            inputSize: before.fileSize,
+
+            outputSize: after.fileSize,
+
+            fastStart: after.fastStart,
+
+            videoReencoding: mode === "tiktok",
+
+            fpsInterpolation: false,
+
+            fpsTimingPreserved: true,
+
+            audioReencoding: mode === "tiktok",
+
+            codec: mode === "tiktok" ? "H.264" : "Original",
+
+            resolution: "No upscaling",
+
+            qualitySetting: mode === "tiktok"
+                ? "CRF " + NEON_CONFIG.crf
+                : "Original stream",
+
+            originalFrameTiming: true
+
+        }
+
+    };
+
+}
+
+
+// =====================================================
+// PUBLIC API
+// =====================================================
 
 window.NEON_V5 = {
-  inspectVideoV5,
-  optimizeVideoV5,
-  rebuildMP4FastStartV5
+
+    version: NEON_CONFIG.version,
+
+    inspectVideoV5,
+
+    optimizeVideoV5,
+
+    qualityMethod,
+
+    fpsMethod,
+
+    tiktokOptimizer,
+
+    loadFFmpeg
+
 };
+
+console.log(
+    "NEON COMPRESS V5.2 ENGINE READY"
+);
 
 })();
