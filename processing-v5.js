@@ -235,9 +235,9 @@ async function inspectVideoV5(file) {
 }
 
 
-// =====================================================
-// LOAD FFMPEG
-// =====================================================
+// ============================================
+// NEON V5.3 — FFmpeg Worker CORS FIX
+// ============================================
 
 async function loadFFmpeg() {
 
@@ -250,13 +250,6 @@ async function loadFFmpeg() {
     }
 
     ffmpegLoading = (async () => {
-
-        if (!window.crossOriginIsolated) {
-            console.warn(
-                "Cross-origin isolation is disabled. " +
-                "Using single-thread FFmpeg."
-            );
-        }
 
         const { FFmpeg } = await import(
             "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js"
@@ -282,22 +275,48 @@ async function loadFFmpeg() {
             if (typeof window.NEON_V5_PROGRESS === "function") {
                 window.NEON_V5_PROGRESS(percent);
             }
-
         });
 
-        const coreURL = await toBlobURL(
-            NEON_CONFIG.coreURL,
-            "text/javascript"
+        const baseURL =
+            "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+
+        const workerModuleURL =
+            "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js";
+
+        const [coreURL, wasmURL] = await Promise.all([
+
+            toBlobURL(
+                baseURL + "/ffmpeg-core.js",
+                "text/javascript"
+            ),
+
+            toBlobURL(
+                baseURL + "/ffmpeg-core.wasm",
+                "application/wasm"
+            )
+
+        ]);
+
+        // Create a same-origin Blob Worker wrapper.
+        // The wrapper imports the original ESM worker.
+
+        const workerSource =
+            `import("${workerModuleURL}");`;
+
+        const workerBlob = new Blob(
+            [workerSource],
+            { type: "text/javascript" }
         );
 
-        const wasmURL = await toBlobURL(
-            NEON_CONFIG.wasmURL,
-            "application/wasm"
-        );
+        const classWorkerURL =
+            URL.createObjectURL(workerBlob);
 
         await ffmpeg.load({
+
             coreURL,
-            wasmURL
+            wasmURL,
+            classWorkerURL
+
         });
 
         ffmpegInstance = ffmpeg;
@@ -313,6 +332,8 @@ async function loadFFmpeg() {
     } catch (error) {
 
         ffmpegLoading = null;
+
+        console.error("[NEON FFmpeg ERROR]", error);
 
         throw new Error(
             "FFmpeg loading failed: " + error.message
