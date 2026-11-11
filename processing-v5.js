@@ -115,9 +115,10 @@ function readBoxes(data, start = 0, end = data.length) {
 }
 
 
-// =====================================================
-// VIDEO INSPECTION
-// =====================================================
+// ============================================
+// FIXED MP4 INSPECTOR — NEON V5.3
+// Reads MP4 box headers without loading mdat
+// ============================================
 
 async function inspectVideoV5(file) {
 
@@ -129,48 +130,85 @@ async function inspectVideoV5(file) {
         throw new Error("Video file is empty.");
     }
 
-    const header = new Uint8Array(
-        await file.slice(0, Math.min(file.size, 1024 * 1024))
-            .arrayBuffer()
-    );
+    const boxes = [];
+    let offset = 0;
 
-    const boxes = readBoxes(header);
+    while (offset + 8 <= file.size) {
 
-    const ftyp = boxes.find(box => box.type === "ftyp");
+        const headerBuffer = await file.slice(
+            offset,
+            Math.min(offset + 16, file.size)
+        ).arrayBuffer();
 
-    if (!ftyp) {
-        throw new Error("MP4 format not recognized.");
-    }
+        const view = new DataView(headerBuffer);
 
-    const moov = boxes.find(box => box.type === "moov");
-    const mdat = boxes.find(box => box.type === "mdat");
+        let size = view.getUint32(0);
 
-    // If moov is beyond the first 1 MB, scan the complete file.
-    let fullBoxes = boxes;
-
-    if (!moov || !mdat) {
-
-        const completeData = new Uint8Array(
-            await file.arrayBuffer()
+        const type = String.fromCharCode(
+            view.getUint8(4),
+            view.getUint8(5),
+            view.getUint8(6),
+            view.getUint8(7)
         );
 
-        fullBoxes = readBoxes(completeData);
+        let headerSize = 8;
 
+        if (size === 1) {
+
+            if (headerBuffer.byteLength < 16) {
+                throw new Error("Invalid extended MP4 box.");
+            }
+
+            const high = view.getUint32(8);
+            const low = view.getUint32(12);
+
+            size = high * 4294967296 + low;
+
+            headerSize = 16;
+
+        } else if (size === 0) {
+
+            size = file.size - offset;
+
+        }
+
+        if (
+            !Number.isSafeInteger(size) ||
+            size < headerSize ||
+            offset + size > file.size
+        ) {
+            throw new Error(
+                "Invalid MP4 box: " + type
+            );
+        }
+
+        boxes.push({
+            type: type,
+            start: offset,
+            end: offset + size,
+            size: size,
+            headerSize: headerSize
+        });
+
+        offset += size;
     }
 
-    const finalMoov = fullBoxes.find(
-        box => box.type === "moov"
-    );
+    if (offset !== file.size) {
+        throw new Error("Invalid MP4 box structure.");
+    }
 
-    const finalMdat = fullBoxes.find(
-        box => box.type === "mdat"
-    );
+    const ftyp = boxes.find(b => b.type === "ftyp");
+    const moov = boxes.find(b => b.type === "moov");
+    const mdat = boxes.find(b => b.type === "mdat");
 
-    if (!finalMoov || !finalMdat) {
-        throw new Error("Required MP4 boxes are missing.");
+    if (!ftyp || !moov || !mdat) {
+        throw new Error(
+            "Required MP4 boxes are missing."
+        );
     }
 
     return {
+
         fileName: file.name || "video.mp4",
 
         fileSize: file.size,
@@ -185,13 +223,14 @@ async function inspectVideoV5(file) {
 
         mdat: true,
 
-        fastStart: finalMoov.start < finalMdat.start,
+        fastStart: moov.start < mdat.start,
 
-        moovPosition: finalMoov.start,
+        moovPosition: moov.start,
 
-        mdatPosition: finalMdat.start,
+        mdatPosition: mdat.start,
 
-        topLevelBoxes: fullBoxes.map(box => box.type)
+        topLevelBoxes: boxes.map(b => b.type)
+
     };
 }
 
