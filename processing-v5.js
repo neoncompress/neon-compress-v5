@@ -1,676 +1,332 @@
-// =====================================================
-// NEON COMPRESS V5.2
-// INDEPENDENT VIDEO PROCESSING ENGINE
+//Processing.js
+// NEON COMPRESS V3 — FAST QUALITY + FPS PROCESSOR
+// Fast path: do not re-encode the video.
+// Original picture, audio and FPS remain unchanged.
+// CompressBase patches MP4 metadata/container locally.
+// Removes the exact "Patched by Compressbase" comment if present.
 //
-// QUALITY METHOD  : Original stream copy
-// FPS METHOD      : Preserve original frame timing
-// TIKTOK OPTIMIZER: H.264 MP4 re-encoding
-//
-// No CompressBase dependency
-// Single-thread FFmpeg WASM
-// =====================================================
+// Output filename: neoncompress.mp4
 
-(function () {
-"use strict";
+let compressBaseModulePromise = null;
 
-const NEON_CONFIG = {
-    version: "5.2",
+async function getCompressBase() {
+  if (!compressBaseModulePromise) {
+    compressBaseModulePromise = import(
+      /* @vite-ignore */ 'https://compressbase.com/method-api/client.mjs'
+    ).catch((error) => {
+      compressBaseModulePromise = null;
+      throw error;
+    });
+  }
 
-    ffmpeg: "0.12.10",
-
-    coreURL:
-      "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js",
-
-    wasmURL:
-      "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.wasm",
-
-    defaultMode: "tiktok",
-
-    crf: 18,
-
-    preset: "medium",
-
-    audioBitrate: "192k"
-};
-
-let ffmpegInstance = null;
-let ffmpegLoading = null;
-
-
-// =====================================================
-// BASIC UTILITIES
-// =====================================================
-
-function formatSize(bytes) {
-    return (bytes / 1048576).toFixed(2) + " MB";
+  return compressBaseModulePromise;
 }
 
-function readType(view, offset) {
-    return String.fromCharCode(
-        view.getUint8(offset),
-        view.getUint8(offset + 1),
-        view.getUint8(offset + 2),
-        view.getUint8(offset + 3)
+/**
+ * Remove the exact CompressBase comment from the MP4 moov atom.
+ *
+ * @param {Blob} file
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{blob: Blob, removedCount: number}>}
+ */
+export async function removeCompressBaseComment(file, signal) {
+  const marker = new TextEncoder().encode('Patched by Compressbase');
+  const chunkSize = 1024 * 1024;
+
+  let offset = 0;
+  let moovStart = -1;
+  let moovEnd = -1;
+  let moovHeaderSize = 8;
+
+  // Locate the MP4 moov atom.
+  while (offset + 8 <= file.size) {
+    signal?.throwIfAborted();
+
+    const headerBytes = new Uint8Array(
+      await file.slice(offset, offset + 16).arrayBuffer()
     );
-}
 
-function readBoxes(data, start = 0, end = data.length) {
+    if (headerBytes.length < 8) {
+      break;
+    }
 
     const view = new DataView(
-        data.buffer,
-        data.byteOffset,
-        data.byteLength
+      headerBytes.buffer,
+      headerBytes.byteOffset,
+      headerBytes.byteLength
     );
 
-    const boxes = [];
+    let atomSize = view.getUint32(0);
 
-    let offset = start;
+    const atomType = String.fromCharCode(
+      headerBytes[4],
+      headerBytes[5],
+      headerBytes[6],
+      headerBytes[7]
+    );
 
-    while (offset + 8 <= end) {
+    let headerSize = 8;
 
-        let size = view.getUint32(offset);
+    if (atomSize === 1) {
+      if (headerBytes.length < 16) {
+        throw new Error(
+          'The MP4 has an incomplete extended atom header.'
+        );
+      }
 
-        const type = readType(view, offset + 4);
+      const extendedSize = view.getBigUint64(8);
 
-        let headerSize = 8;
+      if (extendedSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(
+          'The MP4 atom is too large for safe metadata editing.'
+        );
+      }
 
-        if (size === 1) {
-
-            if (offset + 16 > end) {
-                throw new Error("Invalid MP4 extended box");
-            }
-
-            const high = view.getUint32(offset + 8);
-            const low = view.getUint32(offset + 12);
-
-            size = high * 4294967296 + low;
-
-            headerSize = 16;
-
-        } else if (size === 0) {
-
-            size = end - offset;
-        }
-
-        if (
-            !Number.isSafeInteger(size) ||
-            size < headerSize ||
-            offset + size > end
-        ) {
-            throw new Error("Invalid MP4 box: " + type);
-        }
-
-        boxes.push({
-            type,
-            start: offset,
-            end: offset + size,
-            size,
-            headerSize
-        });
-
-        offset += size;
+      atomSize = Number(extendedSize);
+      headerSize = 16;
+    } else if (atomSize === 0) {
+      atomSize = file.size - offset;
     }
 
-    return boxes;
+    if (
+      atomSize < headerSize ||
+      offset + atomSize > file.size
+    ) {
+      throw new Error(
+        'The MP4 atom structure is invalid; metadata was not changed.'
+      );
+    }
+
+    if (atomType === 'moov') {
+      moovStart = offset;
+      moovEnd = offset + atomSize;
+      moovHeaderSize = headerSize;
+      break;
+    }
+
+    offset += atomSize;
+  }
+
+  if (moovStart < 0) {
+    throw new Error(
+      'Could not find the MP4 metadata atom (moov).'
+    );
+  }
+
+  // Search only inside moov.
+  const searchStart = moovStart + moovHeaderSize;
+  const foundOffsets = [];
+
+  let scanStart = searchStart;
+
+  while (scanStart < moovEnd) {
+    signal?.throwIfAborted();
+
+    const ownedEnd = Math.min(
+      scanStart + chunkSize,
+      moovEnd
+    );
+
+    const readEnd = Math.min(
+      ownedEnd + marker.length - 1,
+      moovEnd
+    );
+
+    const bytes = new Uint8Array(
+      await file.slice(scanStart, readEnd).arrayBuffer()
+    );
+
+    for (
+      let i = 0;
+      i <= bytes.length - marker.length;
+      i += 1
+    ) {
+      if (scanStart + i >= ownedEnd) {
+        break;
+      }
+
+      let match = true;
+
+      for (let j = 0; j < marker.length; j += 1) {
+        if (bytes[i + j] !== marker[j]) {
+          match = false;
+          break;
+        }
+      }
+
+      if (match) {
+        foundOffsets.push(scanStart + i);
+      }
+    }
+
+    scanStart = ownedEnd;
+  }
+
+  if (foundOffsets.length === 0) {
+    return {
+      blob: file,
+      removedCount: 0
+    };
+  }
+
+  // Replace the exact marker with same-length zero bytes.
+  const parts = [];
+  let copyFrom = 0;
+
+  const blank = new Uint8Array(marker.length);
+
+  for (const found of foundOffsets) {
+    parts.push(
+      file.slice(copyFrom, found),
+      blank
+    );
+
+    copyFrom = found + marker.length;
+  }
+
+  parts.push(file.slice(copyFrom));
+
+  return {
+    blob: new Blob(parts, {
+      type: 'video/mp4'
+    }),
+    removedCount: foundOffsets.length
+  };
 }
 
+/**
+ * Apply the CompressBase Quality + FPS patch.
+ *
+ * Output filename: neoncompress.mp4
+ *
+ * @param {File|Blob} file
+ * @param {(percent: number) => void} onProgress
+ * @param {string} mode
+ * @param {{
+ *   postingDevice?: string,
+ *   signal?: AbortSignal,
+ *   onStatus?: (message: string) => void
+ * }} options
+ * @returns {Promise<{blob: Blob, name: string}>}
+ */
+export async function optimizeVideo(
+  file,
+  onProgress = () => {},
+  mode = 'max',
+  options = {}
+) {
+  const {
+    postingDevice = 'variant-1',
+    signal,
+    onStatus = () => {}
+  } = options ?? {};
 
-// ============================================
-// FIXED MP4 INSPECTOR — NEON V5.3
-// Reads MP4 box headers without loading mdat
-// ============================================
+  if (
+    !file ||
+    typeof file.slice !== 'function' ||
+    typeof file.size !== 'number'
+  ) {
+    throw new Error(
+      'Please select a valid video file.'
+    );
+  }
 
-async function inspectVideoV5(file) {
+  if (file.name && !/\.mp4$/i.test(file.name)) {
+    throw new Error(
+      'Please select an MP4 video.'
+    );
+  }
 
-    if (!(file instanceof Blob)) {
-        throw new Error("Please select a video file.");
+  if (file.size < 16) {
+    throw new Error(
+      'The selected video file is too small or empty.'
+    );
+  }
+
+  if (file.size > 8 * 1024 ** 3) {
+    throw new Error(
+      'CompressBase supports MP4 files up to 8 GiB.'
+    );
+  }
+
+  if (
+    ![
+      'variant-1',
+      'variant-2',
+      'variant-3'
+    ].includes(postingDevice)
+  ) {
+    throw new Error(
+      'Choose variant-1, variant-2, or variant-3.'
+    );
+  }
+
+  signal?.throwIfAborted();
+
+  onProgress(5);
+  onStatus(
+    'Preparing the MP4 for Quality + FPS…'
+  );
+
+  try {
+    const { patchVideo } = await getCompressBase();
+
+    signal?.throwIfAborted();
+
+    const patchedBlob = await patchVideo(file, {
+      postingDevice,
+      signal,
+
+      onStatus: (message) => {
+        onStatus(message);
+        onProgress(70);
+      }
+    });
+
+    if (
+      !(patchedBlob instanceof Blob) ||
+      patchedBlob.size === 0
+    ) {
+      throw new Error(
+        'CompressBase returned an empty MP4.'
+      );
     }
 
-    if (!file.size) {
-        throw new Error("Video file is empty.");
-    }
+    onStatus(
+      'Removing the CompressBase comment from MP4 metadata…'
+    );
 
-    const boxes = [];
-    let offset = 0;
+    onProgress(85);
 
-    while (offset + 8 <= file.size) {
+    const {
+      blob: outputBlob,
+      removedCount
+    } = await removeCompressBaseComment(
+      patchedBlob,
+      signal
+    );
 
-        const headerBuffer = await file.slice(
-            offset,
-            Math.min(offset + 16, file.size)
-        ).arrayBuffer();
+    signal?.throwIfAborted();
 
-        const view = new DataView(headerBuffer);
+    onProgress(100);
 
-        let size = view.getUint32(0);
-
-        const type = String.fromCharCode(
-            view.getUint8(4),
-            view.getUint8(5),
-            view.getUint8(6),
-            view.getUint8(7)
-        );
-
-        let headerSize = 8;
-
-        if (size === 1) {
-
-            if (headerBuffer.byteLength < 16) {
-                throw new Error("Invalid extended MP4 box.");
-            }
-
-            const high = view.getUint32(8);
-            const low = view.getUint32(12);
-
-            size = high * 4294967296 + low;
-
-            headerSize = 16;
-
-        } else if (size === 0) {
-
-            size = file.size - offset;
-
-        }
-
-        if (
-            !Number.isSafeInteger(size) ||
-            size < headerSize ||
-            offset + size > file.size
-        ) {
-            throw new Error(
-                "Invalid MP4 box: " + type
-            );
-        }
-
-        boxes.push({
-            type: type,
-            start: offset,
-            end: offset + size,
-            size: size,
-            headerSize: headerSize
-        });
-
-        offset += size;
-    }
-
-    if (offset !== file.size) {
-        throw new Error("Invalid MP4 box structure.");
-    }
-
-    const ftyp = boxes.find(b => b.type === "ftyp");
-    const moov = boxes.find(b => b.type === "moov");
-    const mdat = boxes.find(b => b.type === "mdat");
-
-    if (!ftyp || !moov || !mdat) {
-        throw new Error(
-            "Required MP4 boxes are missing."
-        );
-    }
+    onStatus(
+      removedCount > 0
+        ? 'Done. CompressBase comment removed; video and FPS were not re-encoded.'
+        : 'Done. No CompressBase comment was found; video and FPS were not re-encoded.'
+    );
 
     return {
-
-        fileName: file.name || "video.mp4",
-
-        fileSize: file.size,
-
-        fileSizeMB: formatSize(file.size),
-
-        format: "MP4",
-
-        ftyp: true,
-
-        moov: true,
-
-        mdat: true,
-
-        fastStart: moov.start < mdat.start,
-
-        moovPosition: moov.start,
-
-        mdatPosition: mdat.start,
-
-        topLevelBoxes: boxes.map(b => b.type)
-
-    };
-}
-
-
-// ============================================
-// NEON V5.3 — FFmpeg Worker CORS FIX
-// ============================================
-
-async function loadFFmpeg() {
-
-    if (ffmpegInstance && ffmpegInstance.loaded) {
-        return ffmpegInstance;
-    }
-
-    if (ffmpegLoading) {
-        return ffmpegLoading;
-    }
-
-    ffmpegLoading = (async () => {
-
-        const { FFmpeg } = await import(
-            "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js"
-        );
-
-        const { toBlobURL } = await import(
-            "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js"
-        );
-
-        const ffmpeg = new FFmpeg();
-
-        ffmpeg.on("log", ({ message }) => {
-            console.log("[NEON FFmpeg]", message);
-        });
-
-        ffmpeg.on("progress", ({ progress }) => {
-
-            const percent = Math.max(
-                0,
-                Math.min(100, Math.round(progress * 100))
-            );
-
-            if (typeof window.NEON_V5_PROGRESS === "function") {
-                window.NEON_V5_PROGRESS(percent);
-            }
-        });
-
-        const baseURL =
-            "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
-
-        const workerModuleURL =
-            "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js";
-
-        const [coreURL, wasmURL] = await Promise.all([
-
-            toBlobURL(
-                baseURL + "/ffmpeg-core.js",
-                "text/javascript"
-            ),
-
-            toBlobURL(
-                baseURL + "/ffmpeg-core.wasm",
-                "application/wasm"
-            )
-
-        ]);
-
-        // Create a same-origin Blob Worker wrapper.
-        // The wrapper imports the original ESM worker.
-
-        const workerSource =
-            `import("${workerModuleURL}");`;
-
-        const workerBlob = new Blob(
-            [workerSource],
-            { type: "text/javascript" }
-        );
-
-        const classWorkerURL =
-            URL.createObjectURL(workerBlob);
-
-        await ffmpeg.load({
-
-            coreURL,
-            wasmURL,
-            classWorkerURL
-
-        });
-
-        ffmpegInstance = ffmpeg;
-
-        return ffmpeg;
-
-    })();
-
-    try {
-
-        return await ffmpegLoading;
-
-    } catch (error) {
-
-        ffmpegLoading = null;
-
-        console.error("[NEON FFmpeg ERROR]", error);
-
-        throw new Error(
-            "FFmpeg loading failed: " + error.message
-        );
-
-    }
-}
-
-
-// =====================================================
-// FILE CLEANUP
-// =====================================================
-
-async function cleanupFFmpeg(ffmpeg, files) {
-
-    for (const name of files) {
-
-        try {
-            await ffmpeg.deleteFile(name);
-        } catch (error) {
-            console.warn("Cleanup skipped:", name);
-        }
-
-    }
-}
-
-
-// =====================================================
-// QUALITY METHOD
-// Original Video Stream Copy
-// =====================================================
-
-async function qualityMethod(file) {
-
-    const ffmpeg = await loadFFmpeg();
-
-    const inputName = "neon_input.mp4";
-    const outputName = "neon_quality.mp4";
-
-    try {
-
-        await ffmpeg.writeFile(
-            inputName,
-            new Uint8Array(await file.arrayBuffer())
-        );
-
-        await ffmpeg.exec([
-
-            "-i", inputName,
-
-            "-map", "0:v:0",
-
-            "-map", "0:a?",
-
-            "-c", "copy",
-
-            "-map_metadata", "0",
-
-            "-movflags", "+faststart",
-
-            "-f", "mp4",
-
-            outputName
-
-        ]);
-
-        const result = await ffmpeg.readFile(outputName);
-
-        return new Blob(
-            [result.buffer.slice(
-                result.byteOffset,
-                result.byteOffset + result.byteLength
-            )],
-            { type: "video/mp4" }
-        );
-
-    } finally {
-
-        await cleanupFFmpeg(
-            ffmpeg,
-            [inputName, outputName]
-        );
-
-    }
-}
-
-
-// =====================================================
-// FPS METHOD
-// Preserve Original Frame Timing
-// =====================================================
-
-async function fpsMethod(file) {
-
-    const ffmpeg = await loadFFmpeg();
-
-    const inputName = "neon_fps_input.mp4";
-    const outputName = "neon_fps_output.mp4";
-
-    try {
-
-        await ffmpeg.writeFile(
-            inputName,
-            new Uint8Array(await file.arrayBuffer())
-        );
-
-        await ffmpeg.exec([
-
-            "-i", inputName,
-
-            "-map", "0:v:0",
-
-            "-map", "0:a?",
-
-            "-c", "copy",
-
-            "-fps_mode", "passthrough",
-
-            "-map_metadata", "0",
-
-            "-movflags", "+faststart",
-
-            "-f", "mp4",
-
-            outputName
-
-        ]);
-
-        const result = await ffmpeg.readFile(outputName);
-
-        return new Blob(
-            [result.buffer.slice(
-                result.byteOffset,
-                result.byteOffset + result.byteLength
-            )],
-            { type: "video/mp4" }
-        );
-
-    } finally {
-
-        await cleanupFFmpeg(
-            ffmpeg,
-            [inputName, outputName]
-        );
-
-    }
-}
-
-
-// =====================================================
-// TIKTOK OPTIMIZER
-// H.264 MP4 RE-ENCODING
-// =====================================================
-
-async function tiktokOptimizer(file) {
-
-    const ffmpeg = await loadFFmpeg();
-
-    const inputName = "neon_tiktok_input.mp4";
-    const outputName = "neon_tiktok_output.mp4";
-
-    try {
-
-        await ffmpeg.writeFile(
-            inputName,
-            new Uint8Array(await file.arrayBuffer())
-        );
-
-        await ffmpeg.exec([
-
-            "-i", inputName,
-
-            "-map", "0:v:0",
-
-            "-map", "0:a?",
-
-            // H.264 Video
-            "-c:v", "libx264",
-
-            // High visual quality
-            "-preset", NEON_CONFIG.preset,
-
-            "-crf", String(NEON_CONFIG.crf),
-
-            // Compatible pixel format
-            "-pix_fmt", "yuv420p",
-
-            "-profile:v", "high",
-
-            // Keep original frame timing
-            "-fps_mode", "passthrough",
-
-            // AAC Audio
-            "-c:a", "aac",
-
-            "-b:a", NEON_CONFIG.audioBitrate,
-
-            "-ar", "48000",
-
-            // Preserve metadata
-            "-map_metadata", "0",
-
-            // MP4 Fast Start
-            "-movflags", "+faststart",
-
-            "-f", "mp4",
-
-            outputName
-
-        ]);
-
-        const result = await ffmpeg.readFile(outputName);
-
-        return new Blob(
-            [result.buffer.slice(
-                result.byteOffset,
-                result.byteOffset + result.byteLength
-            )],
-            { type: "video/mp4" }
-        );
-
-    } finally {
-
-        await cleanupFFmpeg(
-            ffmpeg,
-            [inputName, outputName]
-        );
-
-    }
-}
-
-
-// =====================================================
-// MAIN PROCESSING API
-// =====================================================
-
-async function optimizeVideoV5(file, options = {}) {
-
-    if (!(file instanceof Blob)) {
-        throw new Error("Please select a valid MP4 video.");
-    }
-
-    const mode = (
-        options.mode || NEON_CONFIG.defaultMode
-    ).toLowerCase();
-
-    const before = await inspectVideoV5(file);
-
-    let output;
-
-    if (mode === "quality") {
-
-        output = await qualityMethod(file);
-
-    } else if (mode === "fps") {
-
-        output = await fpsMethod(file);
-
-    } else if (mode === "tiktok") {
-
-        output = await tiktokOptimizer(file);
-
-    } else {
-
-        throw new Error("Unknown processing mode: " + mode);
-
-    }
-
-    if (!output || !output.size) {
-        throw new Error("Processing produced an empty video.");
-    }
-
-    const after = await inspectVideoV5(output);
-
-    return {
-
-        file: output,
-
-        method: mode.toUpperCase(),
-
-        changes: {
-
-            inputSize: before.fileSize,
-
-            outputSize: after.fileSize,
-
-            fastStart: after.fastStart,
-
-            videoReencoding: mode === "tiktok",
-
-            fpsInterpolation: false,
-
-            fpsTimingPreserved: true,
-
-            audioReencoding: mode === "tiktok",
-
-            codec: mode === "tiktok" ? "H.264" : "Original",
-
-            resolution: "No upscaling",
-
-            qualitySetting: mode === "tiktok"
-                ? "CRF " + NEON_CONFIG.crf
-                : "Original stream",
-
-            originalFrameTiming: true
-
-        }
-
+      blob: outputBlob,
+      name: 'neoncompress.mp4'
     };
 
+  } catch (error) {
+    console.error(
+      'NEON COMPRESS processing error:',
+      error
+    );
+
+    throw error;
+  }
 }
-
-
-// =====================================================
-// PUBLIC API
-// =====================================================
-
-window.NEON_V5 = {
-
-    version: NEON_CONFIG.version,
-
-    inspectVideoV5,
-
-    optimizeVideoV5,
-
-    qualityMethod,
-
-    fpsMethod,
-
-    tiktokOptimizer,
-
-    loadFFmpeg
-
-};
-
-console.log(
-    "NEON COMPRESS V5.2 ENGINE READY"
-);
-
-})();
