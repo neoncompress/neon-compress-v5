@@ -1,332 +1,508 @@
-//Processing.js
-// NEON COMPRESS V3 — FAST QUALITY + FPS PROCESSOR
-// Fast path: do not re-encode the video.
-// Original picture, audio and FPS remain unchanged.
-// CompressBase patches MP4 metadata/container locally.
-// Removes the exact "Patched by Compressbase" comment if present.
-//
-// Output filename: neoncompress.mp4
+// ======================================================
+// NEON COMPRESS V5
+// CompressBase Max Quality + FPS Integration
+// Independent Processing Engine
+// ======================================================
 
-let compressBaseModulePromise = null;
+(function () {
+  "use strict";
 
-async function getCompressBase() {
-  if (!compressBaseModulePromise) {
-    compressBaseModulePromise = import(
-      /* @vite-ignore */ 'https://compressbase.com/method-api/client.mjs'
-    ).catch((error) => {
-      compressBaseModulePromise = null;
-      throw error;
-    });
-  }
+  let compressBaseModulesPromise = null;
+  let processingInProgress = false;
 
-  return compressBaseModulePromise;
-}
+  const SUPPORTED_VARIANTS = new Set([
+    "variant-1",
+    "variant-2",
+    "variant-3"
+  ]);
 
-/**
- * Remove the exact CompressBase comment from the MP4 moov atom.
- *
- * @param {Blob} file
- * @param {AbortSignal} [signal]
- * @returns {Promise<{blob: Blob, removedCount: number}>}
- */
-export async function removeCompressBaseComment(file, signal) {
-  const marker = new TextEncoder().encode('Patched by Compressbase');
-  const chunkSize = 1024 * 1024;
+  // ======================================================
+  // LOAD COMPRESSBASE MODULES
+  // ======================================================
 
-  let offset = 0;
-  let moovStart = -1;
-  let moovEnd = -1;
-  let moovHeaderSize = 8;
+  async function getCompressBaseModules() {
 
-  // Locate the MP4 moov atom.
-  while (offset + 8 <= file.size) {
-    signal?.throwIfAborted();
+    if (!compressBaseModulesPromise) {
 
-    const headerBytes = new Uint8Array(
-      await file.slice(offset, offset + 16).arrayBuffer()
-    );
+      compressBaseModulesPromise = Promise.all([
 
-    if (headerBytes.length < 8) {
-      break;
-    }
+        import(
+          "https://compressbase.com/method-api/downscale.mjs"
+        ),
 
-    const view = new DataView(
-      headerBytes.buffer,
-      headerBytes.byteOffset,
-      headerBytes.byteLength
-    );
+        import(
+          "https://compressbase.com/method-api/client.mjs"
+        )
 
-    let atomSize = view.getUint32(0);
+      ])
+      .then(([downscaleModule, clientModule]) => {
 
-    const atomType = String.fromCharCode(
-      headerBytes[4],
-      headerBytes[5],
-      headerBytes[6],
-      headerBytes[7]
-    );
-
-    let headerSize = 8;
-
-    if (atomSize === 1) {
-      if (headerBytes.length < 16) {
-        throw new Error(
-          'The MP4 has an incomplete extended atom header.'
-        );
-      }
-
-      const extendedSize = view.getBigUint64(8);
-
-      if (extendedSize > BigInt(Number.MAX_SAFE_INTEGER)) {
-        throw new Error(
-          'The MP4 atom is too large for safe metadata editing.'
-        );
-      }
-
-      atomSize = Number(extendedSize);
-      headerSize = 16;
-    } else if (atomSize === 0) {
-      atomSize = file.size - offset;
-    }
-
-    if (
-      atomSize < headerSize ||
-      offset + atomSize > file.size
-    ) {
-      throw new Error(
-        'The MP4 atom structure is invalid; metadata was not changed.'
-      );
-    }
-
-    if (atomType === 'moov') {
-      moovStart = offset;
-      moovEnd = offset + atomSize;
-      moovHeaderSize = headerSize;
-      break;
-    }
-
-    offset += atomSize;
-  }
-
-  if (moovStart < 0) {
-    throw new Error(
-      'Could not find the MP4 metadata atom (moov).'
-    );
-  }
-
-  // Search only inside moov.
-  const searchStart = moovStart + moovHeaderSize;
-  const foundOffsets = [];
-
-  let scanStart = searchStart;
-
-  while (scanStart < moovEnd) {
-    signal?.throwIfAborted();
-
-    const ownedEnd = Math.min(
-      scanStart + chunkSize,
-      moovEnd
-    );
-
-    const readEnd = Math.min(
-      ownedEnd + marker.length - 1,
-      moovEnd
-    );
-
-    const bytes = new Uint8Array(
-      await file.slice(scanStart, readEnd).arrayBuffer()
-    );
-
-    for (
-      let i = 0;
-      i <= bytes.length - marker.length;
-      i += 1
-    ) {
-      if (scanStart + i >= ownedEnd) {
-        break;
-      }
-
-      let match = true;
-
-      for (let j = 0; j < marker.length; j += 1) {
-        if (bytes[i + j] !== marker[j]) {
-          match = false;
-          break;
+        if (
+          typeof downscaleModule.downscaleVideo !== "function"
+        ) {
+          throw new Error(
+            "CompressBase downscaleVideo module failed."
+          );
         }
-      }
 
-      if (match) {
-        foundOffsets.push(scanStart + i);
-      }
+        if (
+          typeof clientModule.patchVideo !== "function"
+        ) {
+          throw new Error(
+            "CompressBase patchVideo module failed."
+          );
+        }
+
+        return {
+          downscaleVideo: downscaleModule.downscaleVideo,
+          patchVideo: clientModule.patchVideo
+        };
+
+      })
+      .catch(error => {
+
+        compressBaseModulesPromise = null;
+
+        throw error;
+
+      });
+
     }
 
-    scanStart = ownedEnd;
+    return compressBaseModulesPromise;
   }
 
-  if (foundOffsets.length === 0) {
-    return {
-      blob: file,
-      removedCount: 0
-    };
-  }
+  // ======================================================
+  // COMPRESSBASE CREDIT
+  // ======================================================
 
-  // Replace the exact marker with same-length zero bytes.
-  const parts = [];
-  let copyFrom = 0;
+  function addCompressBaseCredit(container) {
 
-  const blank = new Uint8Array(marker.length);
+    if (!container) return null;
 
-  for (const found of foundOffsets) {
-    parts.push(
-      file.slice(copyFrom, found),
-      blank
+    const existing = container.querySelector(
+      "[data-compressbase-credit]"
     );
 
-    copyFrom = found + marker.length;
+    if (existing) return existing;
+
+    const credit = document.createElement("p");
+
+    credit.dataset.compressbaseCredit = "true";
+
+    credit.style.cssText = `
+      text-align:center;
+      color:#888;
+      font-size:11px;
+      margin-top:15px;
+    `;
+
+    credit.append("Powered by ");
+
+    const link = document.createElement("a");
+
+    link.href = "https://compressbase.com/";
+
+    link.target = "_blank";
+
+    link.rel = "noopener noreferrer";
+
+    link.textContent = "CompressBase";
+
+    link.style.color = "#ff334e";
+
+    credit.append(link);
+
+    container.append(credit);
+
+    return credit;
   }
 
-  parts.push(file.slice(copyFrom));
+  // ======================================================
+  // FILE SIZE
+  // ======================================================
 
-  return {
-    blob: new Blob(parts, {
-      type: 'video/mp4'
-    }),
-    removedCount: foundOffsets.length
-  };
-}
+  function formatSize(bytes) {
 
-/**
- * Apply the CompressBase Quality + FPS patch.
- *
- * Output filename: neoncompress.mp4
- *
- * @param {File|Blob} file
- * @param {(percent: number) => void} onProgress
- * @param {string} mode
- * @param {{
- *   postingDevice?: string,
- *   signal?: AbortSignal,
- *   onStatus?: (message: string) => void
- * }} options
- * @returns {Promise<{blob: Blob, name: string}>}
- */
-export async function optimizeVideo(
-  file,
-  onProgress = () => {},
-  mode = 'max',
-  options = {}
-) {
-  const {
-    postingDevice = 'variant-1',
-    signal,
-    onStatus = () => {}
-  } = options ?? {};
+    return (
+      bytes / 1024 / 1024
+    ).toFixed(2) + " MB";
 
-  if (
-    !file ||
-    typeof file.slice !== 'function' ||
-    typeof file.size !== 'number'
-  ) {
-    throw new Error(
-      'Please select a valid video file.'
-    );
   }
 
-  if (file.name && !/\.mp4$/i.test(file.name)) {
-    throw new Error(
-      'Please select an MP4 video.'
-    );
+  // ======================================================
+  // INSPECT VIDEO V5
+  // ======================================================
+
+  async function inspectVideoV5(file) {
+
+    if (!file) {
+      throw new Error("Please select a video.");
+    }
+
+    if (file.size < 16) {
+      throw new Error("Invalid video file.");
+    }
+
+    const url = URL.createObjectURL(file);
+
+    try {
+
+      const video = document.createElement("video");
+
+      video.preload = "metadata";
+
+      video.muted = true;
+
+      video.playsInline = true;
+
+      video.src = url;
+
+      await new Promise((resolve, reject) => {
+
+        video.onloadedmetadata = resolve;
+
+        video.onerror = () => {
+          reject(
+            new Error("Cannot read video metadata.")
+          );
+        };
+
+      });
+
+      const result = {
+
+        engine: "NEON COMPRESS V5",
+
+        fileName: file.name,
+
+        fileSize: formatSize(file.size),
+
+        fileType: file.type || "Unknown",
+
+        duration: Number(
+          video.duration.toFixed(3)
+        ),
+
+        resolution: {
+
+          width: video.videoWidth,
+
+          height: video.videoHeight
+
+        },
+
+        aspectRatio:
+          video.videoWidth +
+          "x" +
+          video.videoHeight,
+
+        fps: "Not reliably detectable through browser metadata inspection",
+
+        processing: "Ready"
+
+      };
+
+      video.remove();
+
+      return result;
+
+    } finally {
+
+      URL.revokeObjectURL(url);
+
+    }
+
   }
 
-  if (file.size < 16) {
-    throw new Error(
-      'The selected video file is too small or empty.'
-    );
-  }
+  // ======================================================
+  // OUTPUT FILE NAME
+  // ======================================================
 
-  if (file.size > 8 * 1024 ** 3) {
-    throw new Error(
-      'CompressBase supports MP4 files up to 8 GiB.'
-    );
-  }
+  function makeOutputFile(blob) {
 
-  if (
-    ![
-      'variant-1',
-      'variant-2',
-      'variant-3'
-    ].includes(postingDevice)
-  ) {
-    throw new Error(
-      'Choose variant-1, variant-2, or variant-3.'
-    );
-  }
-
-  signal?.throwIfAborted();
-
-  onProgress(5);
-  onStatus(
-    'Preparing the MP4 for Quality + FPS…'
-  );
-
-  try {
-    const { patchVideo } = await getCompressBase();
-
-    signal?.throwIfAborted();
-
-    const patchedBlob = await patchVideo(file, {
-      postingDevice,
-      signal,
-
-      onStatus: (message) => {
-        onStatus(message);
-        onProgress(70);
+    return new File(
+      [blob],
+      "neoncompress-v5.mp4",
+      {
+        type: "video/mp4",
+        lastModified: Date.now()
       }
-    });
+    );
 
-    if (
-      !(patchedBlob instanceof Blob) ||
-      patchedBlob.size === 0
-    ) {
+  }
+
+  // ======================================================
+  // OPTIMIZE VIDEO V5
+  // ======================================================
+
+  async function optimizeVideoV5(
+    file,
+    onProgress = () => {},
+    options = {}
+  ) {
+
+    if (!file) {
+      throw new Error("Please select a video.");
+    }
+
+    if (file.size < 16) {
+      throw new Error("Invalid video file.");
+    }
+
+    if (processingInProgress) {
+
       throw new Error(
-        'CompressBase returned an empty MP4.'
+        "Another video is already processing."
       );
+
     }
-
-    onStatus(
-      'Removing the CompressBase comment from MP4 metadata…'
-    );
-
-    onProgress(85);
 
     const {
-      blob: outputBlob,
-      removedCount
-    } = await removeCompressBaseComment(
-      patchedBlob,
-      signal
-    );
 
-    signal?.throwIfAborted();
+      postingDevice = "variant-1",
 
-    onProgress(100);
+      signal,
 
-    onStatus(
-      removedCount > 0
-        ? 'Done. CompressBase comment removed; video and FPS were not re-encoded.'
-        : 'Done. No CompressBase comment was found; video and FPS were not re-encoded.'
-    );
+      onStatus = () => {},
 
-    return {
-      blob: outputBlob,
-      name: 'neoncompress.mp4'
-    };
+      engine = "auto",
 
-  } catch (error) {
-    console.error(
-      'NEON COMPRESS processing error:',
-      error
-    );
+      frameLiteQuality,
 
-    throw error;
+      assetsBaseURL
+
+    } = options;
+
+    if (!SUPPORTED_VARIANTS.has(postingDevice)) {
+
+      throw new Error(
+        "Invalid posting device variant."
+      );
+
+    }
+
+    if (
+      !["auto", "compatibility"].includes(engine)
+    ) {
+
+      throw new Error(
+        "Invalid processing engine."
+      );
+
+    }
+
+    processingInProgress = true;
+
+    try {
+
+      signal?.throwIfAborted();
+
+      onProgress(1);
+
+      onStatus(
+        "Loading NEON V5 processing engine..."
+      );
+
+      // LOAD MODULES
+
+      const {
+        downscaleVideo,
+        patchVideo
+      } = await getCompressBaseModules();
+
+      signal?.throwIfAborted();
+
+      // STEP 1: DOWNSCALE
+
+      onStatus(
+        "Processing video frames..."
+      );
+
+      const mp4 = await downscaleVideo(file, {
+
+        signal,
+
+        engine,
+
+        ...(assetsBaseURL
+          ? { assetsBaseURL }
+          : {}),
+
+        ...(Number.isFinite(frameLiteQuality)
+          ? { frameLiteQuality }
+          : {}),
+
+        onStatus: message => {
+
+          onStatus(message);
+
+        },
+
+        onProgress: fraction => {
+
+          if (Number.isFinite(fraction)) {
+
+            const value = Math.max(
+              0,
+              Math.min(1, fraction)
+            );
+
+            onProgress(
+              Math.round(5 + value * 85)
+            );
+
+          }
+
+        }
+
+      });
+
+      signal?.throwIfAborted();
+
+      if (
+        !(mp4 instanceof Blob) ||
+        mp4.size < 16
+      ) {
+
+        throw new Error(
+          "Video frame processing failed."
+        );
+
+      }
+
+      // STEP 2: PATCH METADATA
+
+      onStatus(
+        "Applying Quality + FPS metadata..."
+      );
+
+      onProgress(93);
+
+      const output = await patchVideo(mp4, {
+
+        postingDevice,
+
+        signal,
+
+        onStatus: message => {
+
+          onStatus(message);
+
+          onProgress(97);
+
+        }
+
+      });
+
+      signal?.throwIfAborted();
+
+      if (
+        !(output instanceof Blob) ||
+        output.size < 16
+      ) {
+
+        throw new Error(
+          "CompressBase returned an invalid MP4."
+        );
+
+      }
+
+      // STEP 3: CREATE FILE
+
+      onProgress(99);
+
+      const outputFile = makeOutputFile(output);
+
+      onProgress(100);
+
+      onStatus(
+        "NEON COMPRESS V5 processing complete."
+      );
+
+      return {
+
+        file: outputFile,
+
+        method:
+          "CompressBase Max Quality + FPS",
+
+        changes: [
+
+          "Local video frame processing",
+
+          "Quality + FPS metadata patch",
+
+          "MP4 output generated",
+
+          "Original audio/video payload handling depends on the processing engine"
+
+        ]
+
+      };
+
+    } catch (error) {
+
+      console.error(
+        "NEON V5 Processing Error:",
+        error
+      );
+
+      throw error;
+
+    } finally {
+
+      processingInProgress = false;
+
+    }
+
   }
-}
+
+  // ======================================================
+  // INITIALIZE
+  // ======================================================
+
+  function initialize() {
+
+    const container = document.querySelector(
+      ".card"
+    );
+
+    if (container) {
+
+      addCompressBaseCredit(container);
+
+    }
+
+  }
+
+  // ======================================================
+  // PUBLIC API
+  // ======================================================
+
+  window.NEON_V5 = {
+
+    inspectVideoV5,
+
+    optimizeVideoV5,
+
+    addCompressBaseCredit,
+
+    version: "5.0.0"
+
+  };
+
+  if (document.readyState === "loading") {
+
+    document.addEventListener(
+      "DOMContentLoaded",
+      initialize
+    );
+
+  } else {
+
+    initialize();
+
+  }
+
+})();
