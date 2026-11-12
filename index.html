@@ -1,11 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#080808">
+
 <title>NEON COMPRESS V5</title>
 
 <style>
+
 :root {
   --red: #ff334e;
   --bg: #080808;
@@ -117,6 +121,30 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.progress-container {
+  width: 100%;
+  height: 7px;
+  background: #292929;
+  border-radius: 20px;
+  margin-top: 15px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  width: 0%;
+  height: 100%;
+  background: var(--red);
+  border-radius: 20px;
+  transition: width .25s ease;
+}
+
+.progress-text {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  margin-top: 8px;
+}
+
 pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -137,6 +165,7 @@ footer {
   font-size: 11px;
   padding: 20px;
 }
+
 </style>
 </head>
 
@@ -145,146 +174,518 @@ footer {
 <div class="container">
 
 <header>
-  <div class="logo">NEON <span>COMPRESS</span></div>
-  <div class="subtitle">V5 INDEPENDENT VIDEO ENGINE</div>
+
+  <div class="logo">
+    NEON <span>COMPRESS</span>
+  </div>
+
+  <div class="subtitle">
+    V5 INDEPENDENT VIDEO ENGINE
+  </div>
+
 </header>
 
+
+<!-- SELECT VIDEO -->
+
 <div class="card">
+
   <h2>SELECT VIDEO</h2>
 
   <label class="upload">
-    <input type="file" id="videoInput" accept="video/mp4,.mp4">
+
+    <input
+      type="file"
+      id="videoInput"
+      accept="video/mp4,.mp4"
+    >
+
     <div>＋</div>
+
     <div>Choose MP4 Video</div>
-    <div class="file-info" id="fileInfo">No video selected</div>
+
+    <div class="file-info" id="fileInfo">
+      No video selected
+    </div>
+
   </label>
 
-  <button id="inspectBtn" disabled>INSPECT VIDEO</button>
-  <button id="processBtn" disabled>START V5 PROCESSING</button>
+  <button id="inspectBtn" disabled>
+    INSPECT VIDEO
+  </button>
 
-  <div class="status" id="status">V5 ENGINE READY</div>
+  <button id="processBtn" disabled>
+    START V5 PROCESSING
+  </button>
+
+  <div class="progress-container">
+
+    <div
+      class="progress-bar"
+      id="progressBar">
+    </div>
+
+  </div>
+
+  <div class="progress-text" id="progressText">
+    0%
+  </div>
+
+  <div class="status" id="status">
+    V5 ENGINE INITIALIZING...
+  </div>
+
 </div>
 
+
+<!-- VIDEO INFORMATION -->
+
 <div class="card">
+
   <h2>VIDEO INFORMATION</h2>
+
   <pre id="info">Waiting for video...</pre>
+
 </div>
 
+
+<!-- PROCESSING RESULT -->
+
 <div class="card">
+
   <h2>PROCESSING RESULT</h2>
+
   <pre id="result">No processing yet.</pre>
-  <button id="downloadBtn" class="secondary" hidden>
+
+  <button
+    id="downloadBtn"
+    class="secondary"
+    hidden
+  >
     DOWNLOAD VIDEO
   </button>
+
 </div>
 
+
 <footer>
+
   NEON COMPRESS V5 — INDEPENDENT TEST VERSION
+
 </footer>
 
 </div>
 
-<script src="./processing.js"></script>
+
+<!-- LOAD PROCESSING ENGINE -->
+
+<script src="./processing.js?v=5.0.2"></script>
+
 
 <script>
+
+// ======================================================
+// ELEMENTS
+// ======================================================
+
 const input = document.getElementById("videoInput");
+
 const fileInfo = document.getElementById("fileInfo");
+
 const inspectBtn = document.getElementById("inspectBtn");
+
 const processBtn = document.getElementById("processBtn");
+
 const downloadBtn = document.getElementById("downloadBtn");
+
 const statusBox = document.getElementById("status");
+
 const infoBox = document.getElementById("info");
+
 const resultBox = document.getElementById("result");
 
+const progressBar = document.getElementById("progressBar");
+
+const progressText = document.getElementById("progressText");
+
+
+// ======================================================
+// VARIABLES
+// ======================================================
+
 let selectedFile = null;
+
 let outputUrl = null;
 
+let isProcessing = false;
+
+
+// ======================================================
+// HELPERS
+// ======================================================
+
 function formatSize(bytes) {
-  return (bytes / 1024 / 1024).toFixed(2) + " MB";
+
+  return (
+    bytes / 1024 / 1024
+  ).toFixed(2) + " MB";
+
 }
 
+
+function setProgress(value) {
+
+  const progress = Math.max(
+    0,
+    Math.min(100, Number(value) || 0)
+  );
+
+  progressBar.style.width = progress + "%";
+
+  progressText.textContent =
+    Math.round(progress) + "%";
+
+}
+
+
+function setStatus(message) {
+
+  statusBox.textContent = message;
+
+}
+
+
+function revokeOutput() {
+
+  if (outputUrl) {
+
+    URL.revokeObjectURL(outputUrl);
+
+    outputUrl = null;
+
+  }
+
+}
+
+
+// ======================================================
+// ENGINE INITIALIZATION
+// ======================================================
+
+function initializeEngine() {
+
+  if (
+    !window.NEON_V5 ||
+    typeof window.NEON_V5.inspectVideoV5 !== "function" ||
+    typeof window.NEON_V5.optimizeVideoV5 !== "function"
+  ) {
+
+    setStatus(
+      "ERROR: PROCESSING.JS NOT LOADED"
+    );
+
+    infoBox.textContent =
+      "NEON V5 engine unavailable.\n\n" +
+      "Check that index.html and processing.js are in the same repository root.";
+
+    inspectBtn.disabled = true;
+
+    processBtn.disabled = true;
+
+    console.error(
+      "NEON_V5 engine unavailable:",
+      window.NEON_V5
+    );
+
+    return false;
+
+  }
+
+  setStatus(
+    "NEON V5 ENGINE READY — " +
+    window.NEON_V5.version
+  );
+
+  console.log(
+    "NEON V5 ENGINE READY",
+    window.NEON_V5
+  );
+
+  return true;
+
+}
+
+
+const engineReady = initializeEngine();
+
+
+// ======================================================
+// VIDEO SELECTION
+// ======================================================
+
 input.addEventListener("change", () => {
-  selectedFile = input.files[0];
+
+  if (isProcessing) return;
+
+  selectedFile = input.files?.[0] || null;
 
   if (!selectedFile) return;
 
-  if (outputUrl) {
-    URL.revokeObjectURL(outputUrl);
-    outputUrl = null;
-  }
+  revokeOutput();
 
   downloadBtn.hidden = true;
-  infoBox.textContent = "Waiting for inspection...";
-  resultBox.textContent = "No processing yet.";
+
+  infoBox.textContent =
+    "Waiting for inspection...";
+
+  resultBox.textContent =
+    "No processing yet.";
+
+  setProgress(0);
 
   fileInfo.textContent =
-    selectedFile.name + " (" + formatSize(selectedFile.size) + ")";
+    selectedFile.name +
+    " (" +
+    formatSize(selectedFile.size) +
+    ")";
 
-  inspectBtn.disabled = false;
-  processBtn.disabled = false;
+  inspectBtn.disabled = !engineReady;
 
-  statusBox.textContent = "VIDEO SELECTED";
+  processBtn.disabled = !engineReady;
+
+  setStatus("VIDEO SELECTED");
+
 });
+
+
+// ======================================================
+// INSPECT VIDEO
+// ======================================================
 
 inspectBtn.addEventListener("click", async () => {
-  try {
-    inspectBtn.disabled = true;
-    statusBox.textContent = "INSPECTING...";
 
-    const data = await window.NEON_V5.inspectVideoV5(selectedFile);
+  if (!selectedFile || isProcessing) return;
 
-    infoBox.textContent = JSON.stringify(data, null, 2);
-    statusBox.textContent = "INSPECTION COMPLETE";
+  if (!engineReady) {
 
-  } catch (error) {
-    statusBox.textContent = "INSPECTION FAILED";
-    infoBox.textContent = error.message;
+    setStatus("PROCESSING ENGINE UNAVAILABLE");
+
+    return;
+
   }
 
-  inspectBtn.disabled = false;
+  try {
+
+    inspectBtn.disabled = true;
+
+    processBtn.disabled = true;
+
+    setStatus("INSPECTING VIDEO...");
+
+    const data =
+      await window.NEON_V5.inspectVideoV5(
+        selectedFile
+      );
+
+    infoBox.textContent =
+      JSON.stringify(data, null, 2);
+
+    setStatus("INSPECTION COMPLETE");
+
+  } catch (error) {
+
+    console.error(error);
+
+    setStatus("INSPECTION FAILED");
+
+    infoBox.textContent =
+      error.message || String(error);
+
+  } finally {
+
+    inspectBtn.disabled = !selectedFile;
+
+    processBtn.disabled = !selectedFile;
+
+  }
+
 });
+
+
+// ======================================================
+// START PROCESSING
+// ======================================================
 
 processBtn.addEventListener("click", async () => {
-  try {
-    processBtn.disabled = true;
-    inspectBtn.disabled = true;
-    downloadBtn.hidden = true;
 
-    statusBox.textContent = "PROCESSING...";
+  if (!selectedFile || isProcessing) return;
 
-    const output = await window.NEON_V5.optimizeVideoV5(selectedFile);
+  if (!engineReady) {
 
-    if (outputUrl) URL.revokeObjectURL(outputUrl);
+    setStatus("PROCESSING ENGINE UNAVAILABLE");
 
-    outputUrl = URL.createObjectURL(output.file);
+    return;
 
-    resultBox.textContent = JSON.stringify({
-      inputSize: formatSize(selectedFile.size),
-      outputSize: formatSize(output.file.size),
-      method: output.method,
-      changes: output.changes
-    }, null, 2);
-
-    downloadBtn.hidden = false;
-    statusBox.textContent = "PROCESSING COMPLETE";
-
-  } catch (error) {
-    statusBox.textContent = "PROCESSING FAILED";
-    resultBox.textContent = error.message;
   }
 
-  processBtn.disabled = false;
-  inspectBtn.disabled = false;
+  isProcessing = true;
+
+  inspectBtn.disabled = true;
+
+  processBtn.disabled = true;
+
+  downloadBtn.hidden = true;
+
+  revokeOutput();
+
+  setProgress(0);
+
+  resultBox.textContent =
+    "Processing started...";
+
+  try {
+
+    setStatus("INITIALIZING V5 PROCESSING...");
+
+    const output =
+      await window.NEON_V5.optimizeVideoV5(
+
+        selectedFile,
+
+        (percent) => {
+
+          setProgress(percent);
+
+        },
+
+        {
+
+          postingDevice: "variant-1",
+
+          engine: "auto",
+
+          onStatus: (message) => {
+
+            setStatus(message);
+
+          }
+
+        }
+
+      );
+
+
+    // VALIDATE OUTPUT
+
+    if (
+      !output ||
+      !(output.file instanceof Blob) ||
+      output.file.size < 16
+    ) {
+
+      throw new Error(
+        "Invalid processing output."
+      );
+
+    }
+
+
+    // CREATE DOWNLOAD URL
+
+    outputUrl = URL.createObjectURL(
+      output.file
+    );
+
+
+    // SHOW RESULT
+
+    resultBox.textContent =
+      JSON.stringify({
+
+        inputFile: selectedFile.name,
+
+        inputSize:
+          formatSize(selectedFile.size),
+
+        outputFile:
+          "neoncompress-v5.mp4",
+
+        outputSize:
+          formatSize(output.file.size),
+
+        method:
+          output.method,
+
+        changes:
+          output.changes
+
+      }, null, 2);
+
+
+    setProgress(100);
+
+    setStatus("PROCESSING COMPLETE");
+
+    downloadBtn.hidden = false;
+
+  } catch (error) {
+
+    console.error(
+      "NEON V5 ERROR:",
+      error
+    );
+
+    setStatus("PROCESSING FAILED");
+
+    resultBox.textContent =
+      error.message || String(error);
+
+  } finally {
+
+    isProcessing = false;
+
+    inspectBtn.disabled = !selectedFile;
+
+    processBtn.disabled = !selectedFile;
+
+  }
+
 });
 
+
+// ======================================================
+// DOWNLOAD VIDEO
+// ======================================================
+
 downloadBtn.addEventListener("click", () => {
+
   if (!outputUrl) return;
 
   const a = document.createElement("a");
+
   a.href = outputUrl;
+
   a.download = "neoncompress-v5.mp4";
+
+  document.body.appendChild(a);
+
   a.click();
+
+  a.remove();
+
 });
+
+
+// ======================================================
+// CLEANUP
+// ======================================================
+
+window.addEventListener("beforeunload", () => {
+
+  revokeOutput();
+
+});
+
 </script>
 
 </body>
